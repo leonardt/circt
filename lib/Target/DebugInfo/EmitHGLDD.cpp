@@ -8,6 +8,7 @@
 
 #include "circt/Dialect/Debug/DebugAttributes.h"
 #include "circt/Dialect/Debug/DebugDialect.h"
+#include "circt/Dialect/HW/HWOps.h"
 #include "circt/Target/DebugInfo.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "llvm/Support/Debug.h"
@@ -16,6 +17,7 @@
 #define DEBUG_TYPE "di"
 
 using namespace circt;
+using llvm::SmallMapVector;
 
 struct DIVariable {
   StringAttr name;
@@ -38,13 +40,14 @@ struct DIHierarchy {
 struct DebugInfo {
   DebugInfo(Operation *op);
 
-  SmallDenseMap<StringAttr, DIHierarchy *> moduleNodes;
+  SmallMapVector<StringAttr, DIHierarchy *, 8> moduleNodes;
 
   DIHierarchy &getOrCreateHierarchyForModule(StringAttr moduleName) {
     auto &slot = moduleNodes[moduleName];
     if (!slot) {
-      slot = new (hierarchyAllocator.Allocate());
+      slot = new (hierarchyAllocator.Allocate()) DIHierarchy;
       slot->name = moduleName;
+      LLVM_DEBUG(llvm::dbgs() << "- Created hierarchy " << moduleName << "\n");
     }
     return *slot;
   }
@@ -60,14 +63,33 @@ DebugInfo::DebugInfo(Operation *op) {
   op->walk([&](Operation *op) {
     LLVM_DEBUG(llvm::dbgs() << "- Visiting " << op->getName() << " at "
                             << op->getLoc() << "\n");
-    if (auto moduleOp = dyn_cast<HWModuleOp>(op)) {
-      auto &hierarchy =
-          getOrCreateHierarchyForModule(moduleOp.getSymNameAttr());
+    if (auto moduleOp = dyn_cast<hw::HWModuleOp>(op)) {
+      auto &hierarchy = getOrCreateHierarchyForModule(moduleOp.getNameAttr());
       hierarchy.op = op;
-    } else if (auto instOp = dyn_cast<InstanceOp>(op)) {
+    } else if (auto instOp = dyn_cast<hw::InstanceOp>(op)) {
       auto &subhierarchy =
-          getOrCreateHierarchyForModule(instOp.getModuleNameAttr());
+          getOrCreateHierarchyForModule(instOp.getModuleNameAttr().getAttr());
     }
+  });
+}
+
+static void encodeLoc(llvm::json::OStream &json, FileLineColLoc loc) {
+  // TODO: Collect this into a `file_info` structure up front.
+  json.attribute("file", loc.getFilename().getValue());
+  if (auto line = loc.getLine())
+    json.attribute("line", line);
+  if (auto col = loc.getColumn())
+    json.attribute("col", col);
+}
+
+static void encodeBestLoc(llvm::json::OStream &json, Location loc) {
+  // TODO: Be more clever about the location we pick here.
+  loc->walk([&](Location loc) {
+    if (auto fileLoc = dyn_cast<FileLineColLoc>(loc)) {
+      encodeLoc(json, fileLoc);
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
   });
 }
 
@@ -82,7 +104,18 @@ LogicalResult debug::emitHGLDD(ModuleOp module, llvm::raw_ostream &os) {
     json.attribute("hdl_file_index", 42);
   });
 
-  json.attributeObject("objects", [&] {});
+  json.attributeArray("objects", [&] {
+    for (auto [moduleNameAttr, hierarchy] : di.moduleNodes) {
+      json.objectBegin();
+      json.attribute("obj_kind", "module");
+      // TODO: This should probably me `sv.verilogName`.
+      json.attribute("hdl_module", moduleNameAttr.getValue());
+      if (auto *op = hierarchy->op)
+        json.attributeObject("hgl_loc",
+                             [&] { encodeBestLoc(json, op->getLoc()); });
+      json.objectEnd();
+    }
+  });
 
   json.objectEnd();
 
