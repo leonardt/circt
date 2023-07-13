@@ -81,6 +81,7 @@ DebugInfo::DebugInfo(Operation *op) {
         auto *var = new (variableAllocator.Allocate()) DIVariable;
         var->name = port.name;
         var->loc = port.loc;
+        var->value = value;
         hierarchy.variables.push_back(var);
       }
     } else if (auto instOp = dyn_cast<hw::InstanceOp>(op)) {
@@ -166,6 +167,42 @@ LogicalResult debug::emitHGLDD(ModuleOp module, llvm::raw_ostream &os) {
           json.attribute("var_name", var->name.getValue());
           findAndEncodeLoc(json, "hgl_loc", var->loc, false);
           findAndEncodeLoc(json, "hdl_loc", var->loc, true);
+          if (auto value = var->value) {
+            StringAttr portName;
+            auto *defOp = value.getParentBlock()->getParentOp();
+            auto module = dyn_cast<hw::HWModuleOp>(defOp);
+            if (!module)
+              module = defOp->getParentOfType<hw::HWModuleOp>();
+            if (module) {
+              if (auto arg = dyn_cast<BlockArgument>(value)) {
+                portName = dyn_cast_or_null<StringAttr>(
+                    module.getArgNames()[arg.getArgNumber()]);
+              } else {
+                for (auto &use : value.getUses()) {
+                  auto outputOp = dyn_cast<hw::OutputOp>(use.getOwner());
+                  if (!outputOp)
+                    continue;
+                  portName = dyn_cast_or_null<StringAttr>(
+                      module.getResultNames()[use.getOperandNumber()]);
+                  break;
+                }
+              }
+            }
+            if (auto intType = dyn_cast<IntegerType>(value.getType())) {
+              json.attribute("type_name", "logic");
+              if (intType.getIntOrFloatBitWidth() != 1) {
+                json.attributeArray("packed_range", [&] {
+                  json.value(intType.getIntOrFloatBitWidth() - 1);
+                  json.value(0);
+                });
+              }
+            }
+            if (portName) {
+              json.attributeObject("value", [&] {
+                json.attribute("sig_name", portName.getValue());
+              });
+            }
+          }
           json.objectEnd();
         }
       });
