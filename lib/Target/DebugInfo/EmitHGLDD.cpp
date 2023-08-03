@@ -20,6 +20,8 @@ using namespace mlir;
 using namespace circt;
 using llvm::SmallMapVector;
 
+struct DIInstance;
+
 struct DIVariable {
   StringAttr name;
   LocationAttr loc;
@@ -38,7 +40,16 @@ struct DIHierarchy {
   StringAttr name;
 
   SmallVector<DIVariable *, 0> variables;
-  SmallVector<DIHierarchy *, 0> children;
+  SmallVector<DIInstance *, 0> children;
+};
+
+struct DIInstance {
+  /// The operation that generated this instance.
+  Operation *op = nullptr;
+  /// The name of this instance.
+  StringAttr name;
+  /// The instantiated module.
+  DIHierarchy *hierarchy;
 };
 
 struct DebugInfo {
@@ -57,6 +68,7 @@ struct DebugInfo {
   }
 
   llvm::SpecificBumpPtrAllocator<DIHierarchy> hierarchyAllocator;
+  llvm::SpecificBumpPtrAllocator<DIInstance> instanceAllocator;
   llvm::SpecificBumpPtrAllocator<DIVariable> variableAllocator;
 };
 
@@ -75,7 +87,7 @@ DebugInfo::DebugInfo(Operation *op) {
       // Add variables for each of the ports.
       auto outputValues =
           moduleOp.getBodyBlock()->getTerminator()->getOperands();
-      for (auto &port : moduleOp.getAllPorts()) {
+      for (auto &port : moduleOp.getPortList()) {
         auto value = port.isOutput() ? outputValues[port.argNum]
                                      : moduleOp.getArgument(port.argNum);
         auto *var = new (variableAllocator.Allocate()) DIVariable;
@@ -92,10 +104,24 @@ DebugInfo::DebugInfo(Operation *op) {
           getOrCreateHierarchyForModule(parentModule.getNameAttr());
       auto &childHierarchy =
           getOrCreateHierarchyForModule(instOp.getModuleNameAttr().getAttr());
-      parentHierarchy.children.push_back(&childHierarchy);
+      auto *instance = new (instanceAllocator.Allocate()) DIInstance;
+      instance->name = instOp.getInstanceNameAttr();
+      instance->op = instOp;
+      instance->hierarchy = &childHierarchy;
+      parentHierarchy.children.push_back(instance);
 
       // TODO: What do we do with the port assignments? These should be tracked
       // somewhere.
+    } else if (auto wireOp = dyn_cast<hw::WireOp>(op)) {
+      auto parentModule = op->getParentOfType<hw::HWModuleOp>();
+      if (!parentModule)
+        return;
+      auto *var = new (variableAllocator.Allocate()) DIVariable;
+      var->name = wireOp.getNameAttr();
+      var->loc = wireOp.getLoc();
+      var->value = wireOp;
+      getOrCreateHierarchyForModule(parentModule.getNameAttr())
+          .variables.push_back(var);
     }
   });
 }
@@ -177,14 +203,15 @@ LogicalResult debug::emitHGLDD(ModuleOp module, llvm::raw_ostream &os) {
               if (auto arg = dyn_cast<BlockArgument>(value)) {
                 portName = dyn_cast_or_null<StringAttr>(
                     module.getArgNames()[arg.getArgNumber()]);
+              } else if (auto wireOp = value.getDefiningOp<hw::WireOp>()) {
+                portName = wireOp.getNameAttr();
               } else {
                 for (auto &use : value.getUses()) {
-                  auto outputOp = dyn_cast<hw::OutputOp>(use.getOwner());
-                  if (!outputOp)
-                    continue;
-                  portName = dyn_cast_or_null<StringAttr>(
-                      module.getResultNames()[use.getOperandNumber()]);
-                  break;
+                  if (auto outputOp = dyn_cast<hw::OutputOp>(use.getOwner())) {
+                    portName = dyn_cast_or_null<StringAttr>(
+                        module.getResultNames()[use.getOperandNumber()]);
+                    break;
+                  }
                 }
               }
             }
@@ -202,6 +229,18 @@ LogicalResult debug::emitHGLDD(ModuleOp module, llvm::raw_ostream &os) {
                 json.attribute("sig_name", portName.getValue());
               });
             }
+          }
+          json.objectEnd();
+        }
+      });
+      json.attributeArray("children", [&] {
+        for (auto *instance : hierarchy->children) {
+          json.objectBegin();
+          json.attribute("module_name", instance->hierarchy->name.getValue());
+          json.attribute("inst_name", instance->name.getValue());
+          if (auto *op = instance->op) {
+            findAndEncodeLoc(json, "hgl_loc", op->getLoc(), false);
+            findAndEncodeLoc(json, "hdl_loc", op->getLoc(), true);
           }
           json.objectEnd();
         }
