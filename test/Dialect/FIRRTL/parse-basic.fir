@@ -1689,12 +1689,42 @@ circuit BasicProps :
 
   ; CHECK-LABEL: module private @Path
   module Path :
-    ; CHECK-SAME: in %a: !firrtl.path
-    ; CHECK-SAME: out %b: !firrtl.path
-    input a : Path
-    output b : Path
-    ; CHECK: firrtl.propassign %b, %a : !firrtl.path
-    propassign b, a
+    output psimple : Path
+    output pbundle : Path
+    output pvector : Path
+    output pinst : Path
+    output pinstport : Path
+    output pport : Path
+    ; CHECK: in %port: !firrtl.uint<8> sym @sym_3
+    input port : UInt<8>
+
+    ; CHECK: %simple = firrtl.wire sym @sym interesting_name : !firrtl.uint<8>
+    ; CHECK: %0 = firrtl.path <@Path::@sym>
+    ; CHECK: firrtl.propassign %psimple, %0 : !firrtl.path
+    wire simple : UInt<8>
+    propassign psimple, path(simple)
+
+    ; CHECK: %bundle = firrtl.wire sym [<@sym_0,1,public>] interesting_name : !firrtl.bundle<a: uint<8>>
+    ; CHECK: %1 = firrtl.path <@Path::@sym_0>
+    ; CHECK: firrtl.propassign %pbundle, %1 : !firrtl.path
+    wire bundle : {a: UInt<8>}
+    propassign pbundle, path(bundle.a)
+
+    ; CHECK: %vector = firrtl.wire sym [<@sym_1,3,public>] interesting_name : !firrtl.vector<uint<8>, 10>
+    ; CHECK: %2 = firrtl.path <@Path::@sym_1>
+    ; CHECK: firrtl.propassign %pvector, %2 : !firrtl.path
+    wire vector : UInt<8>[10]
+    propassign pvector, path(vector[2])
+    
+    ; CHECK: %child_a = firrtl.instance child sym @sym_2 interesting_name @String(out a: !firrtl.string)
+    ; CHECK: %3 = firrtl.path <@Path::@sym_2>
+    ; CHECK: firrtl.propassign %pinst, %3 : !firrtl.path
+    inst child of String
+    propassign pinst, path(child)
+
+    ; CHECK: %4 = firrtl.path <@Path::@sym_3>
+    ; CHECK: firrtl.propassign %pinstport, %4 : !firrtl.path
+    propassign pinstport, path(port)
 
   ; CHECK-LABEL firrtl.class @SimpleClass(in %a: !firrtl.string, out %b: !firrtl.string) {
   ; CHECK-NEXT    firrtl.propassign %b, %a : !firrtl.string

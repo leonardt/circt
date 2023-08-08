@@ -1037,29 +1037,11 @@ ParseResult FIRParser::parseOptionalRUW(RUWAttr &result) {
 //===----------------------------------------------------------------------===//
 
 // Entries in a symbol table are either an mlir::Value for the operation that
-// defines the value or an unbundled ID tracking the index in the
-// UnbundledValues list.
-using UnbundledID = llvm::PointerEmbeddedInt<unsigned, 31>;
-using SymbolValueEntry = llvm::PointerUnion<Value, UnbundledID>;
-
+// defines the value or an operation.
+using SymbolValueEntry = llvm::PointerUnion<Value, Operation *>;
 using ModuleSymbolTable =
     llvm::StringMap<std::pair<SMLoc, SymbolValueEntry>, llvm::BumpPtrAllocator>;
 using ModuleSymbolTableEntry = ModuleSymbolTable::MapEntryTy;
-
-using UnbundledValueEntry = SmallVector<std::pair<Attribute, Value>>;
-using UnbundledValuesList = std::vector<UnbundledValueEntry>;
-namespace {
-/// This structure is used to track which entries are added while inside a scope
-/// and remove them upon exiting the scope.
-struct UnbundledValueRestorer {
-  UnbundledValuesList &list;
-  size_t startingSize;
-  UnbundledValueRestorer(UnbundledValuesList &list) : list(list) {
-    startingSize = list.size();
-  }
-  ~UnbundledValueRestorer() { list.resize(startingSize); }
-};
-} // namespace
 
 using SubaccessCache = llvm::DenseMap<std::pair<Value, unsigned>, Value>;
 
@@ -1134,6 +1116,11 @@ struct FIRModuleContext : public FIRParser {
     return addSymbolEntry(name, SymbolValueEntry(value), loc,
                           insertNameIntoGlobalScope);
   }
+  ParseResult addSymbolEntry(StringRef name, Operation *op, SMLoc loc,
+                             bool insertNameIntoGlobalScope = false) {
+    return addSymbolEntry(name, SymbolValueEntry(op), loc,
+                          insertNameIntoGlobalScope);
+  }
 
   /// Resolved a symbol table entry to a value.  Emission of error is optional.
   ParseResult resolveSymbolEntry(Value &result, SymbolValueEntry &entry,
@@ -1148,16 +1135,6 @@ struct FIRModuleContext : public FIRParser {
   /// name is unknown.
   ParseResult lookupSymbolEntry(SymbolValueEntry &result, StringRef name,
                                 SMLoc loc);
-
-  UnbundledValueEntry &getUnbundledEntry(unsigned index) {
-    assert(index < unbundledValues.size());
-    return unbundledValues[index];
-  }
-
-  /// This contains one entry for each value in FIRRTL that is represented as a
-  /// bundle type in the FIRRTL spec but for which we represent as an exploded
-  /// set of elements in the FIRRTL dialect.
-  UnbundledValuesList unbundledValues;
 
   /// Provide a symbol table scope that automatically pops all the entries off
   /// the symbol table when the scope is exited.
@@ -1273,28 +1250,23 @@ ParseResult FIRModuleContext::resolveSymbolEntry(Value &result,
                                                  SymbolValueEntry &entry,
                                                  StringRef fieldName,
                                                  SMLoc loc) {
-  if (!entry.is<UnbundledID>()) {
+  auto *op = entry.dyn_cast<Operation *>();
+  if (!op) {
     emitError(loc, "value should not be used from subfield");
     return failure();
   }
 
+  // Search for a port with a matching name.
   auto fieldAttr = StringAttr::get(getContext(), fieldName);
-
-  unsigned unbundledId = entry.get<UnbundledID>() - 1;
-  assert(unbundledId < unbundledValues.size());
-  UnbundledValueEntry &ubEntry = unbundledValues[unbundledId];
-  for (auto elt : ubEntry) {
-    if (elt.first == fieldAttr) {
-      result = elt.second;
-      break;
-    }
-  }
-  if (!result) {
+  auto portNames = op->getAttrOfType<ArrayAttr>("portNames");
+  auto *it = llvm::find(portNames, fieldAttr);
+  if (it == portNames.end()) {
     emitError(loc, "use of invalid field name '")
         << fieldName << "' on bundle value";
     return failure();
   }
 
+  result = op->getResult(std::distance(portNames.begin(), it));
   return success();
 }
 
@@ -1468,6 +1440,9 @@ private:
     return parseExpImpl(result, message, /*isLeadingStmt:*/ true);
   }
   ParseResult parseEnumExp(Value &result);
+  ParseResult parseInnerSymTarget(hw::InnerSymTarget &result,
+                                  const Twine &message);
+  ParseResult parsePath(Value &result);
   ParseResult parseRefExp(Value &result, const Twine &message);
   ParseResult parseStaticRefExp(Value &result, const Twine &message);
 
@@ -1760,6 +1735,17 @@ ParseResult FIRStmtParser::parseExpImpl(Value &result, const Twine &message,
         builder.create<FIntegerConstantOp>(APSInt(value, /*isUnsigned=*/false));
     break;
   }
+  case FIRToken::lp_path:
+    if (FIRVersion::compare(version, FIRVersion({3, 1, 0})) < 0)
+      return emitError() << "unexpected token: Integers are a FIRRTL 3.1.0+ "
+                            "feature, but the specified FIRRTL version was "
+                         << version;
+
+    if (isLeadingStmt)
+      return emitError("unexpected path() as start of statement");
+    if (parsePath(result))
+      return failure();
+    break;
 
     // Otherwise there are a bunch of keywords that are treated as identifiers
     // try them.
@@ -1777,7 +1763,7 @@ ParseResult FIRStmtParser::parseExpImpl(Value &result, const Twine &message,
     if (!moduleContext.resolveSymbolEntry(result, symtabEntry, loc, false))
       break;
 
-    assert(symtabEntry.is<UnbundledID>() && "should be an instance");
+    assert(symtabEntry.is<Operation *>() && "should be an instance");
 
     // Otherwise we referred to an implicitly bundled value.  We *must* be in
     // the midst of processing a field ID reference or 'is invalid'.  If not,
@@ -1789,11 +1775,8 @@ ParseResult FIRStmtParser::parseExpImpl(Value &result, const Twine &message,
 
       locationProcessor.setLoc(loc);
       // Invalidate all of the results of the bundled value.
-      unsigned unbundledId = symtabEntry.get<UnbundledID>() - 1;
-      UnbundledValueEntry &ubEntry =
-          moduleContext.getUnbundledEntry(unbundledId);
-      for (auto elt : ubEntry)
-        emitInvalidate(elt.second);
+      for (auto result : symtabEntry.get<Operation *>()->getResults())
+        emitInvalidate(result);
 
       // Signify that we parsed the whole statement.
       result = Value();
@@ -2380,11 +2363,6 @@ ParseResult FIRStmtParser::parseSubBlock(Block &blockToInsertInto,
   auto suiteScope = std::make_unique<FIRModuleContext::ContextScope>(
       moduleContext, &blockToInsertInto);
 
-  // After parsing the when region, we can release any new entries in
-  // unbundledValues since the symbol table entries that refer to them will be
-  // gone.
-  UnbundledValueRestorer x(moduleContext.unbundledValues);
-
   // We parse the substatements into their own parser, so they get inserted
   // into the specified 'when' region.
   auto subParser = std::make_unique<FIRStmtParser>(
@@ -2781,11 +2759,6 @@ ParseResult FIRStmtParser::parseMatch(unsigned matchIndent) {
     // Declarations are scoped to the case.
     FIRModuleContext::ContextScope scope(moduleContext, caseBlock);
 
-    // After parsing the region, we can release any new entries in
-    // unbundledValues since the symbol table entries that refer to them will be
-    // gone.
-    UnbundledValueRestorer x(moduleContext.unbundledValues);
-
     // Parse the argument.
     if (consumeIf(FIRToken::l_paren)) {
       StringAttr identifier;
@@ -2855,7 +2828,7 @@ ParseResult FIRStmtParser::parseStaticRefExp(Value &result,
     if (!moduleContext.resolveSymbolEntry(result, symtabEntry, loc, false))
       return success();
 
-    assert(symtabEntry.is<UnbundledID>() && "should be an instance");
+    assert(symtabEntry.is<Operation *>() && "should be an instance");
 
     // Handle the normal "instance.x" reference.
     StringRef fieldName;
@@ -2866,6 +2839,116 @@ ParseResult FIRStmtParser::parseStaticRefExp(Value &result,
   };
   return failure(parseIdOrInstance() ||
                  parseOptionalExpPostscript(result, false));
+}
+
+/// inner_sym_target ::= id
+///                  ::= inner_sym_target '.' id
+///                  ::= inner_sym_target '[' int ']'
+ParseResult FIRStmtParser::parseInnerSymTarget(hw::InnerSymTarget &result,
+                                               const Twine &message) {
+  StringRef id;
+  auto loc = getToken().getLoc();
+  SymbolValueEntry symtabEntry;
+  if (parseId(id, message) ||
+      moduleContext.lookupSymbolEntry(symtabEntry, id, loc))
+    return failure();
+
+  Type type;
+  if (auto *op = symtabEntry.dyn_cast<Operation *>()) {
+    // It is targeting the operation itself, not a port.
+    result = hw::InnerSymTarget(op);
+    return success();
+  } else {
+    // This target can be a port or a regular value.
+    auto value = symtabEntry.get<Value>();
+    type = value.getType();
+    if (isa<OpResult>(value)) {
+      // This target is a regular value, such as a wire or node.
+      result = hw::InnerSymTarget(value.getDefiningOp());
+    } else {
+      // This target is a module port.
+      auto blockArg = cast<BlockArgument>(value);
+      auto *module = blockArg.getOwner()->getParentOp();
+      auto portNo = blockArg.getArgNumber();
+      result = hw::InnerSymTarget(portNo, module);
+    }
+  }
+
+  // We have our target operation, we just need to parse the field id.
+  uint64_t fieldID = 0;
+  while (true) {
+    if (consumeIf(FIRToken::period)) {
+      SmallVector<StringRef, 3> fields;
+      if (parseFieldIdSeq(fields, "expected field name"))
+        return failure();
+      for (auto fieldName : fields) {
+        if (auto bundle = type_dyn_cast<BundleType>(type)) {
+          if (auto index = bundle.getElementIndex(fieldName)) {
+            fieldID += bundle.getFieldID(*index);
+            continue;
+          }
+        } else if (auto bundle = type_dyn_cast<OpenBundleType>(type)) {
+          if (auto index = bundle.getElementIndex(fieldName)) {
+            fieldID += bundle.getFieldID(*index);
+            continue;
+          }
+        } else {
+          return emitError(loc, "subfield requires bundle operand ");
+        }
+        return emitError(loc,
+                         "unknown field '" + fieldName + "' in bundle type ")
+               << type;
+      }
+    } else if (consumeIf(FIRToken::l_square)) {
+      auto loc = getToken().getLoc();
+      int32_t index;
+      if (parseIntLit(index, "expected index") ||
+          parseToken(FIRToken::r_square, "expected ']'"))
+        return failure();
+
+      if (index < 0)
+        return emitError(loc, "invalid index specifier"), failure();
+
+      if (auto vector = type_dyn_cast<FVectorType>(type)) {
+        if ((unsigned)index < vector.getNumElements()) {
+          fieldID += vector.getFieldID(index);
+          continue;
+        }
+      } else if (auto vector = type_dyn_cast<FVectorType>(type)) {
+        if ((unsigned)index < vector.getNumElements()) {
+          fieldID += vector.getFieldID(index);
+          continue;
+        }
+      } else {
+        return emitError(loc, "subfield requires bundle operand ");
+      }
+      return emitError(loc, "invalid index specifier");
+    } else {
+      break;
+    }
+  }
+  result = hw::InnerSymTarget::getTargetForSubfield(result, fieldID);
+  return success();
+}
+
+/// path ::= 'path(' inner_sym_target ')'
+// NOLINTNEXTLINE(misc-no-recursion)
+ParseResult FIRStmtParser::parsePath(Value &result) {
+  auto startTok = consumeToken(FIRToken::lp_path);
+
+  hw::InnerSymTarget target;
+  if (parseInnerSymTarget(target,
+                          "expected static reference expression in 'path'") ||
+      parseToken(FIRToken::r_paren, "expected ')' in 'path'"))
+    return failure();
+
+  locationProcessor.setLoc(startTok.getLoc());
+
+  auto sym = getInnerRefTo(
+      target, [&](FModuleOp mod) -> ModuleNamespace & { return modNameSpace; });
+  result = builder.create<PathOp>(sym);
+
+  return success();
 }
 
 /// define ::= 'define' static_reference '=' ref_expr info?
@@ -3394,19 +3477,7 @@ ParseResult FIRStmtParser::parseInstance() {
       referencedModule, id, NameKindEnum::InterestingName,
       annotations.getValue(), portAnnotations, false, sym);
 
-  // Since we are implicitly unbundling the instance results, we need to keep
-  // track of the mapping from bundle fields to results in the unbundledValues
-  // data structure.  Build our entry now.
-  UnbundledValueEntry unbundledValueEntry;
-  unbundledValueEntry.reserve(modulePorts.size());
-  for (size_t i = 0, e = modulePorts.size(); i != e; ++i)
-    unbundledValueEntry.push_back({modulePorts[i].name, result.getResult(i)});
-
-  // Add it to unbundledValues and add an entry to the symbol table to remember
-  // it.
-  moduleContext.unbundledValues.push_back(std::move(unbundledValueEntry));
-  auto entryId = UnbundledID(moduleContext.unbundledValues.size());
-  return moduleContext.addSymbolEntry(id, entryId, startTok.getLoc());
+  return moduleContext.addSymbolEntry(id, result, startTok.getLoc());
 }
 
 /// cmem ::= 'cmem' id ':' type info?
@@ -3438,7 +3509,8 @@ ParseResult FIRStmtParser::parseCombMem() {
   auto result = builder.create<CombMemOp>(
       vectorType.getElementType(), vectorType.getNumElements(), id,
       NameKindEnum::InterestingName, annotations, sym);
-  return moduleContext.addSymbolEntry(id, result, startTok.getLoc());
+  return moduleContext.addSymbolEntry(id, result.getResult(),
+                                      startTok.getLoc());
 }
 
 /// smem ::= 'smem' id ':' type ruw? info?
@@ -3473,7 +3545,8 @@ ParseResult FIRStmtParser::parseSeqMem() {
   auto result = builder.create<SeqMemOp>(
       vectorType.getElementType(), vectorType.getNumElements(), ruw, id,
       NameKindEnum::InterestingName, annotations, sym);
-  return moduleContext.addSymbolEntry(id, result, startTok.getLoc());
+  return moduleContext.addSymbolEntry(id, result.getResult(),
+                                      startTok.getLoc());
 }
 
 /// mem ::= 'mem' id ':' info? INDENT memField* DEDENT
@@ -3607,14 +3680,7 @@ ParseResult FIRStmtParser::parseMem(unsigned memIndent) {
       annotations, builder.getArrayAttr(resultAnnotations), hw::InnerSymAttr(),
       MemoryInitAttr(), StringAttr());
 
-  UnbundledValueEntry unbundledValueEntry;
-  unbundledValueEntry.reserve(result.getNumResults());
-  for (size_t i = 0, e = result.getNumResults(); i != e; ++i)
-    unbundledValueEntry.push_back({resultNames[i], result.getResult(i)});
-
-  moduleContext.unbundledValues.push_back(std::move(unbundledValueEntry));
-  auto entryID = UnbundledID(moduleContext.unbundledValues.size());
-  return moduleContext.addSymbolEntry(id, entryID, startTok.getLoc());
+  return moduleContext.addSymbolEntry(id, result, startTok.getLoc());
 }
 
 /// node ::= 'node' id '=' exp info?

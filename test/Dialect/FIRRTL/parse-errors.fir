@@ -326,6 +326,74 @@ circuit PrintfExpr:
 
 ;// -----
 
+FIRRTL version 3.1.0
+circuit PathInvalidReference:
+  module PathNonStaticReference:
+    output out : Path
+
+    ; expected-error @below {{use of unknown declaration 'x'}}
+    propassign out, path(x)
+
+;// -----
+
+FIRRTL version 3.1.0
+circuit PathNonStaticReference:
+  module PathNonStaticReference:
+    input in : UInt<1>
+    output out : Path
+
+    ; expected-error @below {{expected static reference expression in 'path'}}
+    propassign out, path(add(in,in))
+
+;// -----
+
+FIRRTL version 3.1.0
+circuit PathInstancePort:
+  module Child:
+    output out : UInt<8>
+  module PathInstancePort:
+    output out : Path
+
+    inst child of Child
+    ; expected-error @below {{expected ')' in 'path'}}
+    propassign out, path(child.out)
+
+;// -----
+
+FIRRTL version 3.1.0
+circuit PathNegativeIndex:
+  module PathNegativeIndex:
+    input in : UInt<1>[10]
+    output out : Path
+
+    ; expected-error @below {{invalid index specifier}}
+    propassign out, path(in[-1])
+
+;// -----
+
+FIRRTL version 3.1.0
+circuit PathBadIndex:
+  module PathBadIndex:
+    input in : UInt<1>[10]
+    output out : Path
+
+    ; expected-error @below {{invalid index specifier}}
+    propassign out, path(in[20])
+
+;// -----
+
+FIRRTL version 3.1.0
+circuit PathBadField:
+  module PathBadField:
+    input in : {a : UInt<1>}
+    output out : Path
+
+    ; expected-error @below {{unknown field 'b' in bundle type '!firrtl.bundle<a: uint<1>>'}}
+    propassign out, path(in.b)
+
+
+;// -----
+
 circuit ProbeFlipType:
   module ProbeFlipType:
     output p : Probe<{a: UInt, flip b: UInt}> ; expected-error {{probe inner type must be passive}}
