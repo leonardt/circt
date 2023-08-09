@@ -36,7 +36,8 @@ circt::om::getEvaluatorValuesFromAttributes(ArrayRef<Attribute> attributes) {
 }
 
 /// Instantiate an Object with its class name and actual parameters.
-FailureOr<std::shared_ptr<evaluator::ObjectValue>> circt::om::Evaluator::instantiate(
+FailureOr<std::shared_ptr<evaluator::ObjectValue>>
+circt::om::Evaluator::instantiate(
     StringAttr className, ArrayRef<evaluator::EvaluatorValuePtr> actualParams) {
   ClassOp cls = symbolTable.lookup<ClassOp>(className);
   if (!cls)
@@ -202,7 +203,8 @@ circt::om::Evaluator::evaluateObjectField(
   for (auto field : op.getFieldPath().getAsRange<FlatSymbolRefAttr>()) {
     auto currentField = currentObject->getField(field.getAttr());
     finalField = currentField.value();
-    if (auto *nextObject = llvm::dyn_cast<evaluator::ObjectValue>(finalField.get()))
+    if (auto *nextObject =
+            llvm::dyn_cast<evaluator::ObjectValue>(finalField.get()))
       currentObject = nextObject;
   }
 

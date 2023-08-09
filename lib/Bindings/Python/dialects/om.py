@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 
 
 # Wrap a base mlir object with high-level object.
-def wrap_mlir_object(value): 
+def wrap_mlir_object(value):
   # For primitives, return a Python value.
   if isinstance(value, Attribute):
     return attribute_to_var(value)
@@ -32,7 +32,9 @@ def wrap_mlir_object(value):
   assert isinstance(value, BaseObject)
   return Object(value)
 
+
 class List(BaseList):
+
   def __init__(self, obj: BaseList) -> None:
     super().__init__(obj)
 
@@ -44,6 +46,7 @@ class List(BaseList):
   def __iter__(self):
     for i in range(0, self.__len__()):
       yield self.__getitem__(i)
+
 
 # Define the Object class by inheriting from the base implementation in C++.
 class Object(BaseObject):

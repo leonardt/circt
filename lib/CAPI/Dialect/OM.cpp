@@ -196,7 +196,6 @@ intptr_t omListGetNumElements(OMEvaluatorValue objectValue) {
       .size();
 }
 
-
 /// Get an element of the List.
 OMEvaluatorValue omListGetElement(OMEvaluatorValue objectValue, intptr_t pos) {
   return wrap(cast<evaluator::ListValue>(unwrap(objectValue).get())
