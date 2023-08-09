@@ -41,18 +41,18 @@ DEFINE_C_API_PTR_METHODS(OMEvaluator, circt::om::Evaluator)
 
 /// Define our own wrap and unwrap instead of using the usual macro. This is To
 /// handle the std::shared_ptr reference counts appropriately. We want to always
-/// create *new* shared pointers to the Object when we wrap it for C, to
+/// create *new* shared pointers to the EvaluatorValue when we wrap it for C, to
 /// increment the reference count. We want to use the shared_from_this
 /// functionality to ensure it is unwrapped into C++ with the correct reference
 /// count.
 
-static inline OMObject wrap(std::shared_ptr<Object> object) {
-  return OMObject{static_cast<void *>(
-      (new std::shared_ptr<Object>(std::move(object)))->get())};
+static inline OMEvaluatorValue wrap(EvaluatorValuePtr object) {
+  return OMEvaluatorValue{
+      static_cast<void *>((new EvaluatorValuePtr(std::move(object)))->get())};
 }
 
-static inline std::shared_ptr<Object> unwrap(OMObject c) {
-  return static_cast<Object *>(c.ptr)->shared_from_this();
+static inline EvaluatorValuePtr unwrap(OMEvaluatorValue c) {
+  return static_cast<evaluator::EvaluatorValue *>(c.ptr)->shared_from_this();
 }
 
 //===----------------------------------------------------------------------===//
@@ -67,9 +67,10 @@ OMEvaluator omEvaluatorNew(MlirModule mod) {
 
 /// Use the Evaluator to Instantiate an Object from its class name and actual
 /// parameters.
-OMObject omEvaluatorInstantiate(OMEvaluator evaluator, MlirAttribute className,
-                                intptr_t nActualParams,
-                                MlirAttribute const *actualParams) {
+OMEvaluatorValue omEvaluatorInstantiate(OMEvaluator evaluator,
+                                        MlirAttribute className,
+                                        intptr_t nActualParams,
+                                        MlirAttribute const *actualParams) {
   // Unwrap the Evaluator.
   Evaluator *cppEvaluator = unwrap(evaluator);
 
@@ -78,17 +79,17 @@ OMObject omEvaluatorInstantiate(OMEvaluator evaluator, MlirAttribute className,
 
   // Unwrap the actual parameters, which the client must supply as Attributes.
   SmallVector<Attribute> actualParamsTmp;
-  SmallVector<ObjectValue> cppActualParams(
+  auto cppActualParams = getEvaluatorValuesFromAttributes(
       unwrapList(nActualParams, actualParams, actualParamsTmp));
 
   // Invoke the Evaluator to instantiate the Object.
-  FailureOr<std::shared_ptr<Object>> result =
+  FailureOr<std::shared_ptr<evaluator::ObjectValue>> result =
       cppEvaluator->instantiate(cppClassName, cppActualParams);
 
   // If instantiation failed, return a null Object. A Diagnostic will be emitted
   // in this case.
   if (failed(result))
-    return OMObject();
+    return OMEvaluatorValue();
 
   // Wrap and return the Object.
   return wrap(result.value());
@@ -105,44 +106,36 @@ MlirModule omEvaluatorGetModule(OMEvaluator evaluator) {
 //===----------------------------------------------------------------------===//
 
 /// Query if the Object is null.
-bool omEvaluatorObjectIsNull(OMObject object) {
+bool omEvaluatorObjectIsNull(OMEvaluatorValue object) {
   // Just check if the Object shared pointer is null.
   return !object.ptr;
 }
 
 /// Get the Type from an Object, which will be a ClassType.
-MlirType omEvaluatorObjectGetType(OMObject object) {
-  return wrap(unwrap(object)->getType());
+MlirType omEvaluatorObjectGetType(OMEvaluatorValue object) {
+  return wrap(llvm::cast<Object>(unwrap(object).get())->getType());
 }
 
 /// Get an ArrayAttr with the names of the fields in an Object.
-MlirAttribute omEvaluatorObjectGetFieldNames(OMObject object) {
-  return wrap(unwrap(object)->getFieldNames());
+MlirAttribute omEvaluatorObjectGetFieldNames(OMEvaluatorValue object) {
+  return wrap(llvm::cast<Object>(unwrap(object).get())->getFieldNames());
 }
 
 /// Get a field from an Object, which must contain a field of that name.
-OMObjectValue omEvaluatorObjectGetField(OMObject object, MlirAttribute name) {
+OMEvaluatorValue omEvaluatorObjectGetField(OMEvaluatorValue object,
+                                           MlirAttribute name) {
   // Unwrap the Object and get the field of the name, which the client must
   // supply as a StringAttr.
-  FailureOr<ObjectValue> result =
-      unwrap(object)->getField(unwrap(name).cast<StringAttr>());
+  FailureOr<EvaluatorValuePtr> result =
+      llvm::cast<Object>(unwrap(object).get())
+          ->getField(unwrap(name).cast<StringAttr>());
 
   // If getField failed, return a null ObjectValue. A Diagnostic will be emitted
   // in this case.
   if (failed(result))
-    return OMObjectValue();
+    return OMEvaluatorValue();
 
-  // If the field is an Object, return an ObjectValue with the Object set.
-  if (auto *object = std::get_if<std::shared_ptr<Object>>(&result.value()))
-    return OMObjectValue{MlirAttribute(), wrap(*object)};
-
-  // If the field is an Attribute, return an ObjectValue with the Primitive set.
-  if (auto *primitive = std::get_if<Attribute>(&result.value()))
-    return OMObjectValue{wrap(*primitive), OMObject()};
-
-  // This case should never be hit, but return a null ObjectValue that is
-  // neither an Object nor a Primitive.
-  return OMObjectValue();
+  return OMEvaluatorValue{wrap(result.value())};
 }
 
 //===----------------------------------------------------------------------===//
@@ -150,36 +143,64 @@ OMObjectValue omEvaluatorObjectGetField(OMObject object, MlirAttribute name) {
 //===----------------------------------------------------------------------===//
 
 // Query if the ObjectValue is null.
-bool omEvaluatorObjectValueIsNull(OMObjectValue objectValue) {
-  // Check if both Object and Attribute are null.
-  return !omEvaluatorObjectValueIsAObject(objectValue) &&
-         !omEvaluatorObjectValueIsAPrimitive(objectValue);
+bool omEvaluatorValueIsNull(OMEvaluatorValue objectValue) {
+  // Check if the pointer is null.
+  return !objectValue.ptr;
 }
 
 /// Query if the ObjectValue is an Object.
-bool omEvaluatorObjectValueIsAObject(OMObjectValue objectValue) {
+bool omEvaluatorObjectValueIsAObject(OMEvaluatorValue objectValue) {
   // Check if the Object is non-null.
-  return !omEvaluatorObjectIsNull(objectValue.object);
+  return isa<evaluator::ObjectValue>(unwrap(objectValue).get());
 }
 
 /// Get the Object from an  ObjectValue, which must contain an Object.
-OMObject omEvaluatorObjectValueGetObject(OMObjectValue objectValue) {
+/// TODO: This can be removed.
+OMEvaluatorValue omEvaluatorObjectValueGetObject(OMEvaluatorValue objectValue) {
   // Assert the Object is non-null, and return it.
   assert(omEvaluatorObjectValueIsAObject(objectValue));
-  return objectValue.object;
+  return objectValue;
 }
 
 /// Query if the ObjectValue is a Primitive.
-bool omEvaluatorObjectValueIsAPrimitive(OMObjectValue objectValue) {
+bool omEvaluatorObjectValueIsAPrimitive(OMEvaluatorValue objectValue) {
   // Check if the Attribute is non-null.
-  return !mlirAttributeIsNull(objectValue.primitive);
+  return isa<evaluator::AttributeValue>(unwrap(objectValue).get());
 }
 
 /// Get the Primitive from an  ObjectValue, which must contain a Primitive.
-MlirAttribute omEvaluatorObjectValueGetPrimitive(OMObjectValue objectValue) {
+MlirAttribute omEvaluatorObjectValueGetPrimitive(OMEvaluatorValue objectValue) {
   // Assert the Attribute is non-null, and return it.
   assert(omEvaluatorObjectValueIsAPrimitive(objectValue));
-  return objectValue.primitive;
+  return wrap(llvm::cast<evaluator::AttributeValue>(unwrap(objectValue).get())
+                  ->getAttr());
+}
+
+/// Query if the EvaluatorValue is a List.
+bool omEvaluatorObjectValueIsAList(OMEvaluatorValue objectValue) {
+  return isa<evaluator::ListValue>(unwrap(objectValue).get());
+}
+
+/// Get the List from an EvaluatorValue, which must contain a List.
+/// TODO: This can be removed.
+OMEvaluatorValue omEvaluatorObjectValueGetList(OMEvaluatorValue objectValue) {
+  // Assert the List is non-null, and return it.
+  assert(omEvaluatorObjectValueIsAList(objectValue));
+  return objectValue;
+}
+
+/// Get the length of the List.
+intptr_t omListGetNumElements(OMEvaluatorValue objectValue) {
+  return cast<evaluator::ListValue>(unwrap(objectValue).get())
+      ->getElements()
+      .size();
+}
+
+
+/// Get an element of the List.
+OMEvaluatorValue omListGetElement(OMEvaluatorValue objectValue, intptr_t pos) {
+  return wrap(cast<evaluator::ListValue>(unwrap(objectValue).get())
+                  ->getElements()[pos]);
 }
 
 //===----------------------------------------------------------------------===//

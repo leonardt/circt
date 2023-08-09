@@ -41,7 +41,8 @@ void testEvaluator(MlirContext ctx) {
       mlirStringAttrGet(ctx, mlirStringRefCreateFromCString("Test"));
 
   // Test instantiation failure.
-  OMObject failedObject = omEvaluatorInstantiate(evaluator, className, 0, 0);
+  OMEvaluatorValue failedObject =
+      omEvaluatorInstantiate(evaluator, className, 0, 0);
 
   // CHECK: error: actual parameter list length (0) does not match
   // CHECK: object is null: 1
@@ -53,7 +54,7 @@ void testEvaluator(MlirContext ctx) {
   MlirAttribute actualParam =
       mlirIntegerAttrGet(mlirIntegerTypeGet(ctx, 8), 42);
 
-  OMObject object =
+  OMEvaluatorValue object =
       omEvaluatorInstantiate(evaluator, className, 1, &actualParam);
 
   // Test Object type.
@@ -73,20 +74,19 @@ void testEvaluator(MlirContext ctx) {
   MlirAttribute missingFieldName =
       mlirStringAttrGet(ctx, mlirStringRefCreateFromCString("foo"));
 
-  OMObjectValue missingField =
+  OMEvaluatorValue missingField =
       omEvaluatorObjectGetField(object, missingFieldName);
 
   // CHECK: error: field "foo" does not exist
   // CHECK: field is null: 1
-  fprintf(stderr, "field is null: %d\n",
-          omEvaluatorObjectValueIsNull(missingField));
+  fprintf(stderr, "field is null: %d\n", omEvaluatorValueIsNull(missingField));
 
   // Test get field success.
 
   MlirAttribute fieldName =
       mlirStringAttrGet(ctx, mlirStringRefCreateFromCString("field"));
 
-  OMObjectValue field = omEvaluatorObjectGetField(object, fieldName);
+  OMEvaluatorValue field = omEvaluatorObjectGetField(object, fieldName);
 
   // CHECK: field is object: 0
   fprintf(stderr, "field is object: %d\n",
@@ -105,18 +105,19 @@ void testEvaluator(MlirContext ctx) {
   MlirAttribute childFieldName =
       mlirStringAttrGet(ctx, mlirStringRefCreateFromCString("child"));
 
-  OMObjectValue childField = omEvaluatorObjectGetField(object, childFieldName);
+  OMEvaluatorValue childField =
+      omEvaluatorObjectGetField(object, childFieldName);
 
   MlirAttribute fieldNamesO = omEvaluatorObjectGetFieldNames(object);
   // CHECK: ["child", "field"]
   mlirAttributeDump(fieldNamesO);
 
-  OMObject child = omEvaluatorObjectValueGetObject(childField);
+  OMEvaluatorValue child = omEvaluatorObjectValueGetObject(childField);
 
   // CHECK: 0
   fprintf(stderr, "child object is null: %d\n", omEvaluatorObjectIsNull(child));
 
-  OMObjectValue foo = omEvaluatorObjectGetField(
+  OMEvaluatorValue foo = omEvaluatorObjectGetField(
       child, mlirStringAttrGet(ctx, mlirStringRefCreateFromCString("foo")));
 
   MlirAttribute fieldNamesC = omEvaluatorObjectGetFieldNames(child);
