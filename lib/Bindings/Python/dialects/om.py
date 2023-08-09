@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from ._om_ops_gen import *
-from .._mlir_libs._circt._om import Evaluator as BaseEvaluator, Object as BaseObject, ClassType, ReferenceAttr, ListAttr
+from .._mlir_libs._circt._om import Evaluator as BaseEvaluator, Object as BaseObject, List as BaseList, ClassType, ReferenceAttr, ListAttr
 
 from ..ir import Attribute, Diagnostic, DiagnosticSeverity, Module, StringAttr
 from ..support import attribute_to_var, var_to_attribute
@@ -19,6 +19,32 @@ if TYPE_CHECKING:
   from _typeshed.stdlib.dataclass import DataclassInstance
 
 
+# Wrap a base mlir object with high-level object.
+def wrap_mlir_object(value): 
+  # For primitives, return a Python value.
+  if isinstance(value, Attribute):
+    return attribute_to_var(value)
+
+  if isinstance(value, BaseList):
+    return List(value)
+
+  # For objects, return an Object, wrapping the base implementation.
+  assert isinstance(value, BaseObject)
+  return Object(value)
+
+class List(BaseList):
+  def __init__(self, obj: BaseList) -> None:
+    super().__init__(obj)
+
+  # Support iterating over an Object by yielding its fields.
+  def __getitem__(self, i):
+    val = super().__getitem__(i)
+    return wrap_mlir_object(val)
+
+  def __iter__(self):
+    for i in range(0, self.__len__()):
+      yield self.__getitem__(i)
+
 # Define the Object class by inheriting from the base implementation in C++.
 class Object(BaseObject):
 
@@ -28,14 +54,7 @@ class Object(BaseObject):
   def __getattr__(self, name: str):
     # Call the base method to get a field.
     field = super().__getattr__(name)
-
-    # For primitives, return a Python value.
-    if isinstance(field, Attribute):
-      return attribute_to_var(field)
-
-    # For objects, return an Object, wrapping the base implementation.
-    assert isinstance(field, BaseObject)
-    return Object(field)
+    return wrap_mlir_object(field)
 
   # Support iterating over an Object by yielding its fields.
   def __iter__(self):

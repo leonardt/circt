@@ -21,10 +21,33 @@ using namespace mlir::python::adaptors;
 
 namespace {
 
+struct Object;
+struct List;
+using PythonValue = std::variant<Object, MlirAttribute, List>;
+PythonValue translateOMEvaluatorValue(OMEvaluatorValue result);
+
+/// Provides a List class by simply wrapping the OMObject CAPI.
+struct List {
+  // Instantiate an Object with a reference to the underlying OMObject.
+  List(OMEvaluatorValue object) : object(object) {}
+  List(const List &object) : object(object.object) {}
+
+  /// Get the Type from a list, which will be a ListType.
+  MlirType getType() { return omEvaluatorObjectGetType(object); }
+
+  intptr_t getNumElements() { return omListGetNumElements(object); }
+
+  PythonValue getElement(intptr_t i);
+
+private:
+  // The underlying CAPI OMObject.
+  OMEvaluatorValue object;
+};
+
 /// Provides an Object class by simply wrapping the OMObject CAPI.
 struct Object {
   // Instantiate an Object with a reference to the underlying OMObject.
-  Object(OMObject object) : object(object) {}
+  Object(OMEvaluatorValue object) : object(object) {}
   Object(const Object &object) : object(object.object) {}
 
   /// Get the Type from an Object, which will be a ClassType.
@@ -32,28 +55,16 @@ struct Object {
 
   // Get a field from the Object, using pybind's support for variant to return a
   // Python object that is either an Object or Attribute.
-  std::variant<Object, MlirAttribute> getField(const std::string &name) {
+  std::variant<Object, MlirAttribute, List> getField(const std::string &name) {
     // Wrap the requested field name in an attribute.
     MlirContext context = mlirTypeGetContext(omEvaluatorObjectGetType(object));
     MlirStringRef cName = mlirStringRefCreateFromCString(name.c_str());
     MlirAttribute nameAttr = mlirStringAttrGet(context, cName);
 
     // Get the field's ObjectValue via the CAPI.
-    OMObjectValue result = omEvaluatorObjectGetField(object, nameAttr);
+    OMEvaluatorValue result = omEvaluatorObjectGetField(object, nameAttr);
 
-    // If the ObjectValue is null, something failed. Diagnostic handling is
-    // implemented in pure Python, so nothing to do here besides throwing an
-    // error to halt execution.
-    if (omEvaluatorObjectValueIsNull(result))
-      throw py::value_error("unable to get field, see previous error(s)");
-
-    // If the field was an Object, return a new Object.
-    if (omEvaluatorObjectValueIsAObject(result))
-      return Object(omEvaluatorObjectValueGetObject(result));
-
-    // If the field was a primitive, return the Attribute.
-    assert(omEvaluatorObjectValueIsAPrimitive(result));
-    return omEvaluatorObjectValueGetPrimitive(result);
+    return translateOMEvaluatorValue(result);
   }
 
   // Get a list with the names of all the fields in the Object.
@@ -73,7 +84,7 @@ struct Object {
 
 private:
   // The underlying CAPI OMObject.
-  OMObject object;
+  OMEvaluatorValue object;
 };
 
 /// Provides an Evaluator class by simply wrapping the OMEvaluator CAPI.
@@ -85,7 +96,7 @@ struct Evaluator {
   Object instantiate(MlirAttribute className,
                      std::vector<MlirAttribute> actualParams) {
     // Instantiate the Object via the CAPI.
-    OMObject result = omEvaluatorInstantiate(
+    OMEvaluatorValue result = omEvaluatorInstantiate(
         evaluator, className, actualParams.size(), actualParams.data());
 
     // If the Object is null, something failed. Diagnostic handling is
@@ -131,6 +142,30 @@ private:
   intptr_t nextIndex = 0;
 };
 
+PythonValue List::getElement(intptr_t i) {
+  return translateOMEvaluatorValue(omListGetElement(object, i));
+}
+
+PythonValue translateOMEvaluatorValue(OMEvaluatorValue result) {
+  // If the result is null, something failed. Diagnostic handling is
+  // implemented in pure Python, so nothing to do here besides throwing an
+  // error to halt execution.
+  if (omEvaluatorValueIsNull(result))
+    throw py::value_error("unable to get field, see previous error(s)");
+
+  // If the field was an Object, return a new Object.
+  if (omEvaluatorObjectValueIsAObject(result))
+    return Object(omEvaluatorObjectValueGetObject(result));
+
+  // If the field was a list, return a new List.
+  if (omEvaluatorObjectValueIsAList(result))
+    return List(omEvaluatorObjectValueGetList(result));
+
+  // If the field was a primitive, return the Attribute.
+  assert(omEvaluatorObjectValueIsAPrimitive(result));
+  return omEvaluatorObjectValueGetPrimitive(result);
+}
+
 } // namespace
 
 /// Populate the OM Python module.
@@ -144,6 +179,12 @@ void circt::python::populateDialectOMSubmodule(py::module &m) {
            py::arg("class_name"), py::arg("actual_params"))
       .def_property_readonly("module", &Evaluator::getModule,
                              "The Module the Evaluator is built from");
+
+  // Add the List class definition.
+  py::class_<List>(m, "List")
+      .def(py::init<List>(), py::arg("list"))
+      .def("__getitem__", &List::getElement)
+      .def("__len__", &List::getNumElements);
 
   // Add the Object class definition.
   py::class_<Object>(m, "Object")
